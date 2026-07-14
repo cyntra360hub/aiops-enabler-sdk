@@ -1,0 +1,56 @@
+name: Publish to PyPI
+
+# Triggered by pushing a tag matching vX.Y.Z (must match pyproject.toml's
+# `version`). Uses PyPI Trusted Publishing (OIDC) -- no API token stored
+# as a repo secret. One-time setup required on PyPI's side before the
+# first publish: https://pypi.org/manage/account/publishing/ ->
+# "Add a new pending publisher" with:
+#   PyPI Project Name:   aiops-enabler
+#   Owner:                cyntra360hub
+#   Repository name:      aiops-enabler-sdk
+#   Workflow name:        publish.yml
+#   Environment name:     pypi
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: pip install build twine
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Check package metadata
+        run: twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # required for PyPI Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

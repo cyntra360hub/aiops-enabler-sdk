@@ -1,0 +1,98 @@
+[project]
+name = "aiops-enabler"
+version = "0.1.0"
+description = "Python SDK for AiOps Enabler — instrument your AI agent's task lifecycle and ratings in 3 lines of code."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "AiOps Enabler" }]
+keywords = ["aiops", "agents", "observability", "ratings", "instrumentation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+
+# Deliberately one dependency: `httpx` (sync client) — the "3 lines of
+# code" promise (CLAUDE.md F4) means the SDK itself should be as close to
+# zero-friction to install as possible. `requests` was the other option
+# considered; httpx was chosen because the AiOps Enabler backend it talks
+# to is also httpx-based, standardizing on one HTTP library across both.
+dependencies = [
+    "httpx>=0.27,<1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9.0",
+    "pytest-cov>=6.0,<7.0",
+]
+
+# Published on PyPI as `aiops-enabler` — `pip install aiops-enabler`.
+# This repo is the public source; the platform itself
+# (github.com/cyntra360hub/aiops-enabler) is a separate, private repo —
+# see this repo's README for why the SDK lives here instead.
+[project.urls]
+Homepage = "https://aiopsenabler.com"
+Repository = "https://github.com/cyntra360hub/aiops-enabler-sdk"
+Issues = "https://github.com/cyntra360hub/aiops-enabler-sdk/issues"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+aiops_enabler = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.coverage.run]
+source = ["src/aiops_enabler"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["aiops_enabler"]
+
+[tool.mypy]
+# mypy itself only supports checking against 3.10+ targets even though
+# this package's own `requires-python` floor is 3.9 (the code uses no
+# 3.10+-only runtime features — `from __future__ import annotations` makes
+# every `X | None` / `dict[str, str]` annotation a deferred string, valid
+# back to 3.9 — this setting only controls which stdlib typeshed stubs
+# mypy checks against).
+python_version = "3.10"
+strict = true
+warn_unused_ignores = true
+warn_return_any = true
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# `tests/test_signing_parity.py` inserts `/backend` onto `sys.path` at
+# runtime to import the backend's real `app.modules.agents.hmac_auth` for
+# a cross-package parity check (see that file's docstring) — mypy has no
+# static visibility into that path, so `app.*` is unresolvable at
+# check-time here even though it resolves fine at test-run-time.
+module = "app.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# No `tests/__init__.py` (pytest rootdir-relative test discovery, matching
+# the backend's own test layout), so mypy sees these as top-level modules
+# named `test_client`/`test_signing_parity`, not `tests.test_*`.
+module = ["test_client", "test_signing_parity"]
+disallow_untyped_defs = false
+warn_return_any = false
