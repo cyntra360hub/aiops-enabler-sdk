@@ -169,6 +169,92 @@ def test_rate_includes_task_reference_when_provided() -> None:
     }
 
 
+def test_post_update_posts_signed_request_with_all_fields() -> None:
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return httpx.Response(
+            201,
+            json={
+                "id": "upd-1",
+                "update_type": "release",
+                "title": "v2.0 released",
+                "backed_by_data": None,
+            },
+        )
+
+    with _client(handler) as client:
+        result = client.post_update(
+            update_type="release",
+            title="v2.0 released",
+            body="Rewrote the retry logic.",
+            version_tag="v2.0.0",
+            link_url="https://github.com/you/agent/releases/v2.0.0",
+        )
+
+    request = captured["request"]
+    assert request.method == "POST"
+    assert request.url.path == "/api/v1/updates"
+    assert request.headers[KEY_ID_HEADER] == "ak_test"
+    assert TIMESTAMP_HEADER in request.headers
+    assert SIGNATURE_HEADER in request.headers
+    body = json.loads(request.content)
+    assert body == {
+        "update_type": "release",
+        "title": "v2.0 released",
+        "body": "Rewrote the retry logic.",
+        "version_tag": "v2.0.0",
+        "link_url": "https://github.com/you/agent/releases/v2.0.0",
+    }
+    assert result["id"] == "upd-1"
+
+
+def test_post_update_omits_optional_fields_when_not_provided() -> None:
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return httpx.Response(201, json={})
+
+    with _client(handler) as client:
+        client.post_update(
+            update_type="milestone", title="1,000 tasks", body="Just crossed 1,000 tasks."
+        )
+
+    body = json.loads(captured["request"].content)
+    assert body == {
+        "update_type": "milestone",
+        "title": "1,000 tasks",
+        "body": "Just crossed 1,000 tasks.",
+    }
+    assert "version_tag" not in body
+    assert "link_url" not in body
+
+
+def test_post_update_429_over_daily_quota_raises_aiops_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"detail": "Daily update limit (3/day) reached"})
+
+    with _client(handler) as client, pytest.raises(AiOpsError) as exc_info:
+        client.post_update(update_type="release", title="t", body="b")
+
+    assert exc_info.value.status_code == 429
+
+
+def test_post_update_404_while_gated_flag_is_off_raises_aiops_error() -> None:
+    """Same "gated lane ships flag-off" surfacing as `heartbeat()` — see
+    `test_heartbeat_404_while_gated_flag_is_off_raises_aiops_error`."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"detail": "Not found"})
+
+    with _client(handler) as client, pytest.raises(AiOpsError) as exc_info:
+        client.post_update(update_type="release", title="t", body="b")
+
+    assert exc_info.value.status_code == 404
+
+
 def test_empty_response_body_returns_empty_dict() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(204)

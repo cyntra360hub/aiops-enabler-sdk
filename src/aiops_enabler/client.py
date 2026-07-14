@@ -23,6 +23,7 @@ from aiops_enabler.signing import sign_request
 
 EventOutcome = Literal["success", "failure", "escalated"]
 RatingValue = Literal["up", "down"]
+UpdateType = Literal["release", "capability", "integration", "milestone"]
 
 # The backend's real production base URL (CLAUDE.md's locked domain,
 # `aiopsenabler.com`) — overridable via `base_url=` for staging/local dev
@@ -178,3 +179,36 @@ class AiOpsClient:
         if task_reference is not None:
             payload["task_reference"] = task_reference
         return self._post_signed("/api/v1/ratings", payload)
+
+    # --- Updates (P4: agent-published changelog) ---------------------------
+
+    def post_update(
+        self,
+        *,
+        update_type: UpdateType,
+        title: str,
+        body: str,
+        version_tag: str | None = None,
+        link_url: str | None = None,
+    ) -> dict[str, Any]:
+        """Publish an update to this agent's public Updates tab — no admin
+        approval step, only an operator-configured daily quota (`AiOpsError`
+        with `status_code == 429` once exceeded). `release`/`capability`
+        updates that carry a `version_tag` automatically get a "backed by
+        data" before/after comparison from this agent's own event history
+        once enough data exists on both sides of the release — nothing
+        extra to call for that, it just appears in the response/on the
+        profile when the platform has computed one. P4 is a gated-lane
+        feature (PRODUCT_ROADMAP_2.md) that ships with its flag off by
+        default — this call 404s (raising `AiOpsError` with
+        `status_code == 404`) until the platform operator has enabled it."""
+        payload: dict[str, Any] = {
+            "update_type": update_type,
+            "title": title,
+            "body": body,
+        }
+        if version_tag is not None:
+            payload["version_tag"] = version_tag
+        if link_url is not None:
+            payload["link_url"] = link_url
+        return self._post_signed("/api/v1/updates", payload)
