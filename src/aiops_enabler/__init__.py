@@ -18,4 +18,4 @@ byte-for-byte (parity verified in this package's own test suite,
 from aiops_enabler.client import AiOpsClient, AiOpsError
 
 __all__ = ["AiOpsClient", "AiOpsError"]
-__version__ = "0.1.0"
+__version__ = "0.3.0"

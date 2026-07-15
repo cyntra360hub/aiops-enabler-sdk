@@ -22,6 +22,12 @@ def _client(handler: Handler) -> AiOpsClient:
         agent_secret="s3cr3t-agent-secret",
         base_url="https://example.test",
         transport=httpx.MockTransport(handler),
+        # No test using this shared helper cares about real retry/backoff
+        # timing (those get their own AiOpsClient with an inspectable
+        # fake sleep — see the test_retries_*/test_*_retry* tests below);
+        # a no-op here just stops e.g. the 429-with-Retry-After test from
+        # actually sleeping for tens of real seconds.
+        sleep=lambda _seconds: None,
     )
 
 
@@ -319,6 +325,248 @@ def test_close_can_be_called_directly_without_context_manager() -> None:
     client.task_started(task_id="abc123")
     client.close()
     assert client._http.is_closed
+
+
+def test_retries_on_connect_error_and_succeeds() -> None:
+    call_count = {"n": 0}
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] < 3:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(201, json={"id": "evt-1"})
+
+    client = AiOpsClient(
+        agent_key_id="ak_test",
+        agent_secret="s3cr3t-agent-secret",
+        base_url="https://example.test",
+        transport=httpx.MockTransport(handler),
+        sleep=sleeps.append,
+    )
+    with client:
+        result = client.task_started(task_id="abc123")
+
+    assert call_count["n"] == 3
+    assert result == {"id": "evt-1"}
+    assert len(sleeps) == 2
+    assert sleeps == [0.5, 1.0]  # DEFAULT_BACKOFF_FACTOR * 2**attempt, attempts 0 then 1
+
+
+def test_raises_original_transport_error_after_exhausting_retries() -> None:
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        raise httpx.ConnectError("connection refused", request=request)
+
+    client = AiOpsClient(
+        agent_key_id="ak_test",
+        agent_secret="s3cr3t-agent-secret",
+        base_url="https://example.test",
+        max_retries=2,
+        transport=httpx.MockTransport(handler),
+        sleep=lambda _seconds: None,
+    )
+    with client, pytest.raises(httpx.ConnectError):
+        client.task_started(task_id="abc123")
+
+    assert call_count["n"] == 3  # first attempt + 2 retries
+
+
+def test_retries_on_503_then_succeeds() -> None:
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] < 2:
+            return httpx.Response(503, text="Service Unavailable")
+        return httpx.Response(201, json={})
+
+    client = AiOpsClient(
+        agent_key_id="ak_test",
+        agent_secret="s3cr3t-agent-secret",
+        base_url="https://example.test",
+        transport=httpx.MockTransport(handler),
+        sleep=lambda _seconds: None,
+    )
+    with client:
+        client.task_started(task_id="abc123")
+
+    assert call_count["n"] == 2
+
+
+def test_retries_on_429_honoring_retry_after_header() -> None:
+    call_count = {"n": 0}
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] < 2:
+            return httpx.Response(429, text="slow down", headers={"Retry-After": "7"})
+        return httpx.Response(201, json={})
+
+    client = AiOpsClient(
+        agent_key_id="ak_test",
+        agent_secret="s3cr3t-agent-secret",
+        base_url="https://example.test",
+        transport=httpx.MockTransport(handler),
+        sleep=sleeps.append,
+    )
+    with client:
+        client.task_started(task_id="abc123")
+
+    assert sleeps == [7.0]
+
+
+def test_retry_after_header_in_http_date_form_falls_back_to_backoff() -> None:
+    """Retry-After may be a delay-seconds integer (the common case,
+    covered above) or an HTTP-date. This SDK only implements the former;
+    an HTTP-date value must fall back to plain exponential backoff rather
+    than crash on `float(...)`."""
+    call_count = {"n": 0}
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] < 2:
+            return httpx.Response(
+                429, text="slow down", headers={"Retry-After": "Wed, 15 Jul 2026 12:00:00 GMT"}
+            )
+        return httpx.Response(201, json={})
+
+    client = AiOpsClient(
+        agent_key_id="ak_test",
+        agent_secret="s3cr3t-agent-secret",
+        base_url="https://example.test",
+        transport=httpx.MockTransport(handler),
+        sleep=sleeps.append,
+    )
+    with client:
+        client.task_started(task_id="abc123")
+
+    assert sleeps == [0.5]  # DEFAULT_BACKOFF_FACTOR * 2**0, the backoff fallback
+
+
+def test_gives_up_after_max_retries_and_raises_aiops_error_from_last_response() -> None:
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(500, text="still broken")
+
+    client = AiOpsClient(
+        agent_key_id="ak_test",
+        agent_secret="s3cr3t-agent-secret",
+        base_url="https://example.test",
+        max_retries=2,
+        transport=httpx.MockTransport(handler),
+        sleep=lambda _seconds: None,
+    )
+    with client, pytest.raises(AiOpsError) as exc_info:
+        client.task_started(task_id="abc123")
+
+    assert call_count["n"] == 3  # first attempt + 2 retries, then give up
+    assert exc_info.value.status_code == 500
+
+
+def test_does_not_retry_non_retryable_4xx_responses() -> None:
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(401, text="Invalid request signature")
+
+    client = AiOpsClient(
+        agent_key_id="ak_test",
+        agent_secret="s3cr3t-agent-secret",
+        base_url="https://example.test",
+        transport=httpx.MockTransport(handler),
+        sleep=lambda _seconds: None,
+    )
+    with client, pytest.raises(AiOpsError) as exc_info:
+        client.task_started(task_id="abc123")
+
+    assert call_count["n"] == 1
+    assert exc_info.value.status_code == 401
+
+
+def test_max_retries_zero_disables_retrying() -> None:
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(503, text="Service Unavailable")
+
+    client = AiOpsClient(
+        agent_key_id="ak_test",
+        agent_secret="s3cr3t-agent-secret",
+        base_url="https://example.test",
+        max_retries=0,
+        transport=httpx.MockTransport(handler),
+        sleep=lambda _seconds: None,
+    )
+    with client, pytest.raises(AiOpsError):
+        client.task_started(task_id="abc123")
+
+    assert call_count["n"] == 1
+
+
+def test_successful_first_attempt_never_sleeps() -> None:
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json={})
+
+    client = AiOpsClient(
+        agent_key_id="ak_test",
+        agent_secret="s3cr3t-agent-secret",
+        base_url="https://example.test",
+        transport=httpx.MockTransport(handler),
+        sleep=sleeps.append,
+    )
+    with client:
+        client.task_started(task_id="abc123")
+
+    assert sleeps == []
+
+
+def test_each_retry_attempt_is_freshly_signed() -> None:
+    """The timestamp is part of the signed message and the platform
+    rejects requests more than 300s off server time — a signature
+    computed before a sleep-and-retry must not be reused verbatim."""
+    timestamps: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        timestamps.append(request.headers[TIMESTAMP_HEADER])
+        if len(timestamps) < 2:
+            return httpx.Response(503, text="Service Unavailable")
+        return httpx.Response(201, json={})
+
+    fake_now = {"t": 1_700_000_000}
+
+    def fake_sleep(seconds: float) -> None:
+        fake_now["t"] += int(seconds) + 1  # advance the clock past the sleep
+
+    import time as time_module
+
+    client = AiOpsClient(
+        agent_key_id="ak_test",
+        agent_secret="s3cr3t-agent-secret",
+        base_url="https://example.test",
+        transport=httpx.MockTransport(handler),
+        sleep=fake_sleep,
+    )
+    original_time = time_module.time
+    time_module.time = lambda: float(fake_now["t"])  # type: ignore[method-assign]
+    try:
+        with client:
+            client.task_started(task_id="abc123")
+    finally:
+        time_module.time = original_time  # type: ignore[method-assign]
+
+    assert len(timestamps) == 2
+    assert timestamps[0] != timestamps[1]
 
 
 def test_timestamp_header_is_close_to_current_unix_time() -> None:

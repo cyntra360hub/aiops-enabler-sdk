@@ -14,6 +14,8 @@ endpoints in 3 lines of code"::
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Callable
 from types import TracebackType
 from typing import Any, Literal
 
@@ -30,6 +32,16 @@ UpdateType = Literal["release", "capability", "integration", "milestone"]
 # (e.g. `http://localhost:8000`).
 DEFAULT_BASE_URL = "https://api.aiopsenabler.com"
 DEFAULT_TIMEOUT_SECONDS = 10.0
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_BACKOFF_FACTOR = 0.5
+
+# Retried: connection/timeout failures below the HTTP layer, plus
+# server-side signals that a retry is the documented right response to
+# (429 rate-limited, and 5xx). NOT retried: 4xx other than 429 (bad
+# signature, validation errors, revoked key, etc.) — those are permanent
+# until the caller fixes something, so retrying would just burn the
+# platform's per-key rate limit for no benefit.
+_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 
 class AiOpsError(Exception):
@@ -57,6 +69,14 @@ class AiOpsClient:
     manager (``with AiOpsClient(...) as client:``) to close it
     deterministically, or call ``.close()`` yourself — both are optional
     for short-lived scripts.
+
+    Every signed call automatically retries on connection/timeout errors
+    and on 429/5xx responses, with exponential backoff (honoring a
+    server-supplied ``Retry-After`` header when present) — up to
+    ``max_retries`` additional attempts beyond the first. Other 4xx
+    responses (bad signature, validation errors, revoked key, ...) are
+    never retried; they're permanent until the caller changes something.
+    Pass ``max_retries=0`` to disable retries entirely.
     """
 
     def __init__(
@@ -66,10 +86,19 @@ class AiOpsClient:
         agent_secret: str,
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
         transport: httpx.BaseTransport | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._key_id = agent_key_id
         self._secret = agent_secret
+        self._max_retries = max_retries
+        self._backoff_factor = backoff_factor
+        # `sleep=` exists purely so the test suite can assert retry/backoff
+        # behavior without a real test run taking seconds; real callers
+        # never need it.
+        self._sleep = sleep
         # `transport=` is exposed (not just an internal test hook) so a
         # real caller can also inject e.g. a custom proxy/retry transport
         # without subclassing; the SDK's own test suite uses it with
@@ -95,20 +124,55 @@ class AiOpsClient:
 
     # --- Signed POST helper -------------------------------------------
 
+    def _retry_delay_seconds(self, *, attempt: int, response: httpx.Response | None) -> float:
+        if response is not None:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after is not None:
+                try:
+                    return max(0.0, float(retry_after))
+                except ValueError:
+                    pass  # non-numeric Retry-After (HTTP-date form) — fall through to backoff
+        # `2.0 ** attempt` (float base), not `2 ** attempt`: typeshed types
+        # `int ** int` as returning `Any` (to accommodate a negative
+        # exponent producing a float at runtime), which would otherwise
+        # silently infect this function's float-typed return.
+        return self._backoff_factor * (2.0**attempt)
+
     def _post_signed(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         # A stable, compact JSON encoding: the signature covers the exact
         # bytes sent, so it doesn't matter which valid JSON encoding is
         # used as long as it's applied consistently — `separators=(",", ":")`
         # just keeps the wire payload small.
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        headers = sign_request(key_id=self._key_id, secret=self._secret, body=body)
-        response = self._http.post(path, content=body, headers=headers)
-        if response.status_code >= 400:
-            raise AiOpsError(response.status_code, response.text)
-        if not response.content:
-            return {}
-        result: dict[str, Any] = response.json()
-        return result
+
+        attempt = 0
+        while True:
+            # Signed fresh on every attempt, not just once: the timestamp
+            # is part of the signed message and the platform rejects
+            # requests more than 300s off server time, so a signature
+            # computed before a slow first attempt (or a sleep between
+            # retries) must not be reused on the next one.
+            headers = sign_request(key_id=self._key_id, secret=self._secret, body=body)
+            try:
+                response = self._http.post(path, content=body, headers=headers)
+            except httpx.TransportError:
+                if attempt >= self._max_retries:
+                    raise
+                self._sleep(self._retry_delay_seconds(attempt=attempt, response=None))
+                attempt += 1
+                continue
+
+            if response.status_code in _RETRYABLE_STATUS_CODES and attempt < self._max_retries:
+                self._sleep(self._retry_delay_seconds(attempt=attempt, response=response))
+                attempt += 1
+                continue
+
+            if response.status_code >= 400:
+                raise AiOpsError(response.status_code, response.text)
+            if not response.content:
+                return {}
+            result: dict[str, Any] = response.json()
+            return result
 
     # --- Events (F4: Level 2 instrumentation) -----------------------------
 

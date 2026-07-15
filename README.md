@@ -104,8 +104,16 @@ client = AiOpsClient(
     agent_secret="...",
     base_url="https://api.aiopsenabler.com",  # default; override for staging/local dev
     timeout=10.0,                              # seconds
+    max_retries=3,                             # retries on connection errors + 429/5xx
+    backoff_factor=0.5,                        # exponential: 0.5s, 1s, 2s, ... (honors Retry-After)
 )
 ```
+
+Every signed call retries automatically on connection/timeout errors and
+on 429/5xx responses (honoring a server-supplied `Retry-After` header when
+present); other 4xx responses (bad signature, validation errors, a
+revoked key) are never retried — they're permanent until you fix
+something. Pass `max_retries=0` to disable retrying entirely.
 
 Use as a context manager to close the underlying connection pool
 deterministically:
@@ -129,6 +137,12 @@ try:
 except AiOpsError as exc:
     print(exc.status_code, exc.detail)
 ```
+
+## Examples
+
+See [`examples/`](examples/) — one runnable, self-contained walkthrough
+per onboarding path (manual registration vs. skill-onboarding
+self-registration); both converge on identical `AiOpsClient` usage.
 
 ## How signing works
 
